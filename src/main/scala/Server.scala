@@ -1,26 +1,35 @@
 import java.io.{ BufferedReader, BufferedWriter, InputStreamReader, OutputStreamWriter }
-
-import cats.effect._
 import cats.effect.syntax.all._
 import cats.effect.ExitCase._
-import cats.implicits._
 import java.net.{ ServerSocket, Socket }
+import cats.effect._
+import cats.implicits._
+import cats.effect.concurrent.MVar
 
 class Server {
 
-  private def echoProtocol[F[_]: Sync](clientSocket: Socket): F[Unit] = {
+  private def echoProtocol[F[_]: Sync](clientSocket: Socket, stopFlag: MVar[F, Unit]): F[Unit] = {
 
-    def loop(reader: BufferedReader, writer: BufferedWriter): F[Unit] =
+    def loop(reader: BufferedReader, writer: BufferedWriter, stopFlag: MVar[F, Unit]): F[Unit] =
       for {
-        line <- Sync[F].delay(reader.readLine())
+        line <- Sync[F].delay(reader.readLine()).attempt
         _ <- line match {
-              case "" => Sync[F].unit
-              case _ =>
-                Sync[F].delay {
-                  writer.write(line)
-                  writer.newLine()
-                  writer.flush()
-                } >> loop(reader, writer)
+              case Left(e) =>
+                for {
+                  isEmpty <- stopFlag.isEmpty
+                  _       <- if (!isEmpty) Sync[F].unit else Sync[F].raiseError[Unit](e)
+                } yield ()
+              case Right(value) =>
+                value match {
+                  case "STOP" => stopFlag.put(())
+                  case ""     => Sync[F].unit
+                  case _ =>
+                    Sync[F].delay {
+                      writer.write(value)
+                      writer.newLine()
+                      writer.flush()
+                    } >> loop(reader, writer, stopFlag)
+                }
             }
       } yield ()
 
@@ -45,28 +54,35 @@ class Server {
       } yield (input, output)
 
     readerWriter(clientSocket).use {
-      case (reader, writer) =>
-        loop(reader, writer)
+      case (reader, writer) => loop(reader, writer, stopFlag)
     }
   }
 
-  def serve[F[_]: Concurrent](serverSocket: ServerSocket): F[Unit] = {
+  private def serve[F[_]: Concurrent](serverSocket: ServerSocket, stopFlag: MVar[F, Unit]): F[Unit] = {
 
     def close(socket: Socket): F[Unit] = Sync[F].delay(socket.close()).handleErrorWith(_ => Sync[F].unit)
 
     for {
-      _ <- Sync[F]
-            .delay(serverSocket.accept())
-            .bracketCase { socket =>
-              echoProtocol(socket).guarantee(close(socket)).start
-            } { (socket, exit) =>
-              exit match {
-                case ExitCase.Completed           => Sync[F].unit
-                case Error(_) | ExitCase.Canceled => close(socket)
-              }
-            }
-      _ <- serve(serverSocket)
+      socket <- Sync[F]
+                 .delay(serverSocket.accept())
+                 .bracketCase { socket =>
+                   echoProtocol(socket, stopFlag).guarantee(close(socket)).start >> Sync[F].pure(socket)
+                 } { (socket, exit) =>
+                   exit match {
+                     case ExitCase.Completed           => Sync[F].unit
+                     case Error(_) | ExitCase.Canceled => close(socket)
+                   }
+                 }
+      _ <- (stopFlag.read >> close(socket)).start
+      _ <- serve(serverSocket, stopFlag)
     } yield ()
   }
 
+  def server[F[_]: Concurrent](serverSocket: ServerSocket): F[ExitCode] =
+    for {
+      stopFlag    <- MVar[F].empty[Unit]
+      serverFiber <- serve(serverSocket, stopFlag).start
+      _           <- stopFlag.read
+      _           <- serverFiber.cancel.start
+    } yield ExitCode.Success
 }

@@ -10,7 +10,7 @@ object Main extends IOApp {
     val server: Server = new Server
 
     IO(new ServerSocket(args.headOption.map(_.toInt).getOrElse(9999))).bracket { serverSocket =>
-      server.serve[IO](serverSocket) >> IO.pure(ExitCode.Success)
+      server.server[IO](serverSocket) >> IO.pure(ExitCode.Success)
     } { serverSocket =>
       close[IO](serverSocket) >> IO(println("Server finished"))
     }
